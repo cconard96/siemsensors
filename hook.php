@@ -27,6 +27,9 @@
  --------------------------------------------------------------------------
  */
 
+use Symfony\Component\Process\Exception\ProcessFailedException;
+use Symfony\Component\Process\Process;
+
 /**
  * Plugin install process
  *
@@ -49,13 +52,22 @@ function plugin_siemsensors_pull_hostevents(int $hosts_id = -1) {
    
 }
 
-function plugin_siemsensors_pull_serviceevents(int $services_id = -1) {
-   
+function plugin_siemsensors_poll_sensor(array $params) {
+   if (!isset($params['sensor']) || !isset($params['service_ids'])) {
+      return [];
+   }
+
+   switch ($params['sensor']) {
+      case 'ping':
+         return ping($params['service_ids']);
+   }
 }
 
 function plugin_siemsensors_translateEventName(string $name) : string {
    $event_names = [
-      'Ping OK'  => __('Ping OK', 'siemsensors')
+      'sensor_ping_ok'  => __('Ping OK', 'siemsensors'),
+      'sensor_ping_error'  => __('Ping Failed', 'siemsensors'),
+      'sensor_fault'  => __('Sensor fault'),
    ];
 
    if (array_key_exists($name, $event_names)) {
@@ -79,4 +91,157 @@ function plugin_siemsensors_translateEventProperties(array $properties) {
    }
    
    return $properties;
+}
+
+function ping(array $service_ids) {
+  $defparams = [
+     'name_first'      => true,
+  ];
+
+  $hosts = [];
+
+  foreach ($service_ids as $services_id) {
+     $service = new SIEMService();
+     if (!$service->getFromDB($services_id)) {
+        return false;
+     }
+
+     if (isset($service->fields['sensor_params'])) {
+        $sensor_params = json_decode($service->fields['sensor_params'], true);
+     } else {
+        $sensor_params = $defparams;
+     }
+     $sensor_params = array_replace($defparams, $sensor_params);
+     $hosts_id = $service->fields['hosts_id'];
+     $host = new SIEMHost();
+     if (!$host->getFromDB($hosts_id)) {
+        return [];
+     }
+     $hosttype = $host->fields['itemtype'];
+     $host_item = new $hosttype();
+     if (!$host_item->getFromDB($host->fields['items_id'])) {
+        return [];
+     }
+
+     if ($sensor_params['name_first']) {
+        $hosts[$services_id] = $host_item->fields['name'];
+     } else {
+
+     }
+  }
+
+  $results = tryPing($hosts);
+  $eventdatas = [];
+  foreach ($results as $services_id => $result) {
+     if (!isset($result['_sensor_fault'])) {
+        $eventdata = getPingEventData($services_id, $result);
+     } else {
+        $eventdata = null;
+     }
+     if ($eventdata != null) {
+        $eventdatas[$services_id] = $eventdata;
+     }
+  }
+
+  return $eventdatas;
+}
+
+function getPingEventData(int $services_id, array $ping_result) {
+  $event = new SIEMEvent();
+
+  $event_content = [];
+   if (isset($ping_result['percent_loss']) && isset($ping_result['min']) &&
+         isset($ping_result['avg']) && isset($ping_result['max']) && isset($ping_result['mdev'])) {
+      $event_content['percent_loss'] = $ping_result['percent_loss'];
+      $event_content['min'] = $ping_result['min'];
+      $event_content['avg'] = $ping_result['avg'];
+      $event_content['max'] = $ping_result['max'];
+      $event_content['mdev'] = $ping_result['mdev'];
+   } else {
+      //Sensor parse error
+      return [
+         'name'            => 'sensor_ping_error',
+         'status'          => SIEMEvent::STATUS_NEW,
+         'significance'    => SIEMEvent::WARNING,
+         'date'            => $_SESSION['glpi_currenttime'],
+         'content'         => json_encode($event_content),
+         '_sensor_fault'   => true
+      ];
+   }
+
+   return [
+      'name'      => 'sensor_ping_ok',
+      'status'    => SIEMEvent::STATUS_NEW,
+      'significance' => SIEMEvent::INFORMATION,
+      'date'         => $_SESSION['glpi_currenttime'],
+      'content'      => json_encode($event_content),
+   ];
+}
+
+function tryPing(array $hosts, int $count = 5) : array {
+  $results = [];
+  $sub_processes = [];
+
+  foreach ($hosts as $service_id => $host) {
+     $result = [];
+     $process = new Process(['/bin/ping', "-c $count", $host]);
+     $process->run();
+     $sub_processes[$service_id] = $process;
+  }
+
+  // Wait for pings to finish
+  $done = true;
+  do {
+     foreach ($sub_processes as $process) {
+        if ($process->isRunning()) {
+           $done = false;
+           break;
+        }
+     }
+  } while (!$done);
+
+  // Parse results
+  foreach ($sub_processes as $service_id => $process) {
+     $exitcode = $process->getExitCode();
+     if (0 !== $exitcode) {
+        $result = [
+           '_sensor_fault'   => true,
+           'exit_code'       => $exitcode,
+           'error_msg'       => $process->getErrorOutput(),
+        ];
+        $results[$service_id] = $result;
+        continue;
+     }
+
+     $pingresult = $process->getOutput();
+
+     try {
+        $outcome = $pingresult;
+
+        if (preg_match('/(received, )(.*?)(packet)/', $outcome, $match) === 1) {
+           $result['percent_loss'] = str_replace('%', '', trim($match[2]));
+        } else {
+           throw new RuntimeException('Malformed sensor output');
+        }
+        if (preg_match('/(rtt)(.*?)(=)(.*?)(ms)/', $outcome, $match) == 1) {
+           $values = explode('/', trim($match[4]));
+           $result['min'] = $values[0];
+           $result['avg'] = $values[1];
+           $result['max'] = $values[2];
+           $result['mdev'] = $values[3];
+           $results[$service_id] = $result;
+        } else {
+           throw new RuntimeException('Malformed sensor output');
+        }
+     } catch (RuntimeException $e) {
+        $result = [
+           '_sensor_fault'   => true,
+           'exit_code'       => $exitcode,
+           'error_msg'       => $process->getErrorOutput()
+        ];
+        $results[$service_id] = $result;
+     }
+  }
+
+  return $results;
 }
